@@ -8,7 +8,7 @@ import { AppError } from '../utils/AppError.js';
 import { createChatModel } from './llm.factory.js';
 import {
   confidenceFromKeywordScores,
-  retrieveTopDocumentsByKeywords,
+  findTopMatchingDocs,
 } from './retrieval.service.js';
 
 const NOT_FOUND = 'Not found in provided documents';
@@ -19,7 +19,7 @@ const LLM_FALLBACK = {
   confidence: 'low',
 };
 
-function formatContext(documents) {
+function buildContextFromDocs(documents) {
   return documents
     .map((d, i) => {
       const tags = (d.tags || []).join(', ');
@@ -42,7 +42,7 @@ function sanitizeSources(sources, titlesSet) {
 }
 
 export const askUserPromptTemplate = PromptTemplate.fromTemplate(`
-You are answering from a fixed CONTEXT block below. Nothing else exists for this task.
+Below is the only material you may use. Treat it as the full truth for this question—there is nothing else to draw on.
 
 CONTEXT:
 {context}
@@ -50,17 +50,19 @@ CONTEXT:
 QUESTION:
 {question}
 
-Hard rules (breaking any of these is wrong):
-- Use ONLY sentences you can support with the CONTEXT text. No outside knowledge, no guessing, no "typically" or "usually" unless CONTEXT says it.
-- If CONTEXT does not contain enough to answer, respond with answer exactly: "${NOT_FOUND}" and sources [].
-- Do not invent policy names, numbers, dates, or procedures that are not in CONTEXT.
-- sources must be document titles copied exactly from CONTEXT lines that start with "Title:". Empty if answer is "${NOT_FOUND}".
+Please stick to this:
+- Only answer from what is written in CONTEXT. If it is not there, you cannot say it.
+- Do not assume, guess, or fill in gaps from general knowledge. Do not hallucinate details.
+- If CONTEXT does not let you answer the question, your answer must be exactly this sentence and nothing else: ${NOT_FOUND}
+  In that case, "sources" must be an empty array [].
+- When you do answer, "sources" should list the Title lines (exact strings from CONTEXT) that support what you said.
+
 `);
 
-const SYSTEM_CORE = `You follow the user rules literally. If you are unsure, use "${NOT_FOUND}".`;
+const SYSTEM_CORE = `You help users read policy text. When in doubt, say ${NOT_FOUND}.`;
 
 const JSON_RULES =
-  'Reply with one JSON object only (no markdown): {"answer":"string","sources":["string",...]}';
+  'Return a single JSON object only (no markdown): {"answer":"...","sources":["..."]}';
 
 function flattenMessageContent(content) {
   if (typeof content === 'string') return content;
@@ -104,9 +106,9 @@ async function callGroqJson(model, userPrompt) {
   return LlmStructuredSchema.parse(parsed);
 }
 
-export async function invokeLlmForAnswer(question, documents) {
+export async function generateGroundedAnswer(question, documents) {
   const userPrompt = await askUserPromptTemplate.format({
-    context: formatContext(documents),
+    context: buildContextFromDocs(documents),
     question,
   });
 
@@ -114,14 +116,12 @@ export async function invokeLlmForAnswer(question, documents) {
 }
 
 export async function runAskPipeline(question) {
-  const { documents, scores, tokens } = await retrieveTopDocumentsByKeywords(
-    question,
-    3
-  );
+  const { documents, scores, tokens } = await findTopMatchingDocs(question, 3);
   const confidence = confidenceFromKeywordScores(scores, tokens.length);
   const titlesSet = allowedTitles(documents);
   const topScore = scores[0] ?? 0;
 
+  // Nothing in the corpus matched the query tokens—calling the LLM would just invite made-up answers.
   if (topScore === 0 || documents.length === 0) {
     return AskApiResponseSchema.parse({
       answer: NOT_FOUND,
@@ -132,7 +132,7 @@ export async function runAskPipeline(question) {
 
   let llmPart;
   try {
-    llmPart = await invokeLlmForAnswer(question, documents);
+    llmPart = await generateGroundedAnswer(question, documents);
   } catch {
     return AskApiResponseSchema.parse(LLM_FALLBACK);
   }

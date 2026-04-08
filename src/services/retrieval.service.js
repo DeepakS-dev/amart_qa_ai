@@ -1,5 +1,8 @@
 import { Document } from '../models/Document.model.js';
 
+// Keyword overlap is cheap and easy to reason about for a small policy corpus—no embeddings or extra infra.
+// Tradeoff: won't catch paraphrases that don't share words with the doc.
+
 const STOP_WORDS = new Set([
   'the',
   'a',
@@ -100,28 +103,38 @@ const STOP_WORDS = new Set([
   'their',
 ]);
 
-// max points one query token can add to a doc (title + content + one tag hit)
+// Matches how we score: best case one token hits title + content + tag once.
 const MAX_SCORE_PER_TOKEN = 8;
 
-export function tokenizeQuestion(question) {
-  return question
+/** Lowercase, strip punctuation so "refund," and "refund" behave the same. */
+function normalizeText(text) {
+  return String(text)
     .toLowerCase()
-    .split(/\W+/)
-    .map((t) => t.trim())
+    .replace(/[^a-z0-9\s]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+export function tokenizeQuestion(question) {
+  const normalized = normalizeText(question);
+  return normalized
+    .split(/\s+/)
     .filter((t) => t.length >= 3 && !STOP_WORDS.has(t));
 }
 
 function scoreDocument(doc, tokens) {
   if (tokens.length === 0) return 0;
-  const title = doc.title.toLowerCase();
-  const content = doc.content.toLowerCase();
-  const tagSet = (doc.tags || []).map((t) => t.toLowerCase());
+
+  const title = normalizeText(doc.title);
+  const content = normalizeText(doc.content);
+  const tags = (doc.tags || []).map((t) => normalizeText(t));
 
   let score = 0;
   for (const token of tokens) {
+    // Title = strongest signal (short, meant to describe the doc). Content = weak (long, noisy). Tags = middle ground.
     if (title.includes(token)) score += 4;
     if (content.includes(token)) score += 1;
-    for (const tag of tagSet) {
+    for (const tag of tags) {
       if (tag === token || tag.includes(token) || token.includes(tag)) {
         score += 3;
         break;
@@ -131,7 +144,8 @@ function scoreDocument(doc, tokens) {
   return score;
 }
 
-export async function retrieveTopDocumentsByKeywords(question, limit = 3) {
+// Three docs is a practical balance: enough coverage if the right policy isn't rank 1, without stuffing the prompt.
+export async function findTopMatchingDocs(question, limit = 3) {
   const tokens = tokenizeQuestion(question);
   const docs = await Document.find().lean();
   const scored = docs
@@ -149,10 +163,7 @@ export async function retrieveTopDocumentsByKeywords(question, limit = 3) {
   };
 }
 
-/**
- * Confidence from retrieval only. Normalizes top doc score against a theoretical max
- * for this query, then buckets: high > 0.7, medium 0.4–0.7, low < 0.4.
- */
+// Tied to retrieval only—lets the API signal "how well the query matched" without asking the model to self-report.
 export function confidenceFromKeywordScores(scores, tokenCount) {
   const top = scores[0] ?? 0;
   if (top === 0 || tokenCount === 0) return 'low';

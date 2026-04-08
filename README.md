@@ -115,6 +115,15 @@ Folder layout: `routes` → `controllers` → `services` / `models`, plus `middl
 
 ---
 
+## Future improvements
+
+- Add vector database for semantic search
+- Use embeddings for better retrieval
+- Add caching layer for repeated queries
+- Enable streaming responses
+
+---
+
 ## License
 
 ISC
